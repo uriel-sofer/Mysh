@@ -92,7 +92,7 @@ static bool handle_kill(char **tokens, bgjob *jobs, int *bgjobs_counter)
 {
     if (tokens[1] == NULL)
     {
-        printf("mysh**: kill requires a PID\n");
+        printf("kill requires a PID\n");
         return true;
     }
 
@@ -100,7 +100,7 @@ static bool handle_kill(char **tokens, bgjob *jobs, int *bgjobs_counter)
     const long target_pid_long = strtol(tokens[1], &endptr, 10);
     if (*endptr != '\0' || target_pid_long <= 0)
     {
-        printf("mysh**: invalid PID '%s'\n", tokens[1]);
+        printf("Invalid PID '%s'\n", tokens[1]);
         return true;
     }
     const int target_pid = (int) target_pid_long;
@@ -112,7 +112,7 @@ static bool handle_kill(char **tokens, bgjob *jobs, int *bgjobs_counter)
         if (jobs[i].pid == target_pid)
         {
             kill(target_pid, SIGKILL);
-            printf("mysh**: Killed job with PID %d\n", target_pid);
+            printf("Killed job with PID %d\n", target_pid);
 
             // Drag the other jobs back
             for (int j = i; j < *bgjobs_counter - 1; j++)
@@ -126,7 +126,7 @@ static bool handle_kill(char **tokens, bgjob *jobs, int *bgjobs_counter)
     }
 
     if (!found)
-        printf("mysh**: No such background job with PID %d\n", target_pid);
+        printf("No such background job with PID %d\n", target_pid);
 
     return true;
 }
@@ -169,6 +169,11 @@ static bool handle_mysh(char **tokens, bgjob *jobs, int *bgjobs_counter)
     free(line);
     fclose(f);
     return true;
+}
+
+static bool is_exit_builtin(char** tokens)
+{
+    return tokens[0] && (strcmp(tokens[0], "exit") == 0 || strcmp(tokens[0], "bye") == 0);
 }
 
 char *generate_prompt(const char *username, const char *hostname)
@@ -241,11 +246,11 @@ int main(void)
         unsigned int token_count;
         char **tokens = prepare_tokens(line, &token_count);
 
-        if (handle_builtin(tokens, jobs, &bgjobs_counter))
+        if (is_exit_builtin(tokens))
         {
+            handle_builtin(tokens, jobs, &bgjobs_counter);
             free(line);
-            line = NULL;
-            continue;
+            return 0;
         }
 
         execute_tokens(tokens, token_count, jobs, &bgjobs_counter);
@@ -298,7 +303,6 @@ bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
     if (strcmp(tokens[0], "bgjobs") == 0)
         return handle_bgjobs(jobs, bgjobs_counter);
 
-    // This one is a bit unnecessary, it works the same as the shell's kill, but it was requested
     if (strcmp(tokens[0], "kill") == 0)
         return handle_kill(tokens, jobs, bgjobs_counter);
 
@@ -319,44 +323,97 @@ bool is_background_command(char **tokens, unsigned int *token_count)
     return false;
 }
 
-void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
+void extract_input_output_redirection(char **tokens, unsigned int token_count, const char **infile, const char **outfile)
 {
-    if (tokens[0] == NULL)
-        return;
-
-    const char *infile = NULL;
-    const char *outfile = NULL;
+    *infile = NULL;
+    *outfile = NULL;
     for (unsigned int i = 0; i + 1 < token_count; i++)
     {
         if (tokens[i] && tokens[i + 1])
         {
             if (strcmp(tokens[i], "<") == 0)
             {
-                infile = tokens[i + 1];
+                *infile = tokens[i + 1];
                 tokens[i] = NULL;
                 tokens[i + 1] = NULL;
                 i++; // Skip the next token since it's already processed
             }
             else if (strcmp(tokens[i], ">") == 0)
             {
-                outfile = tokens[i + 1];
+                *outfile = tokens[i + 1];
                 tokens[i] = NULL;
                 tokens[i + 1] = NULL;
                 i++; // Skip the next token since it's already processed
             }
         }
     }
+}
+
+void redirect_standard_streams(const char *infile, const char *outfile)
+{
+    if (infile)
+    {
+        if (freopen(infile, "r", stdin) == NULL)
+        {
+            perror("freopen infile");
+            _exit(errno);
+        }
+    }
+    if (outfile)
+    {
+        if (freopen(outfile, "w", stdout) == NULL)
+        {
+            perror("freopen outfile");
+            _exit(errno);
+        }
+    }
+}
+
+void handle_bg_job_execution(char **tokens, bgjob *jobs, int *bgjobs_counter, char **argv, const pid_t exec_line)
+{
+    if (*bgjobs_counter >= MAX_JOBS)
+    {
+        for (int i = 0; i < MAX_JOBS - 1; i++)
+            jobs[i] = jobs[i + 1];
+        (*bgjobs_counter)--;
+    }
+
+    jobs[*bgjobs_counter].pid = exec_line;
+    const char *cmd = (argv[0] != NULL) ? argv[0] : "(null)";
+    strncpy(jobs[*bgjobs_counter].command, cmd, BUFFER_SIZE - 1);
+    jobs[*bgjobs_counter].command[BUFFER_SIZE - 1] = '\0';
+    (*bgjobs_counter)++;
+
+    printf("Started background job \"%s\" with PID %d\n", tokens[0], exec_line);
+    fflush(stdout);
+}
+
+void wait_for_process_completion(const pid_t exec_line)
+{
+    int status;
+    waitpid(exec_line, &status, 0);
+    if (WIFEXITED(status))
+    {
+        const int exit_code = WEXITSTATUS(status);
+        if (exit_code != 0)
+            fprintf(stdout, "command exited with status %d\n", exit_code);
+    }
+    fflush(stderr);
+}
+
+void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
+{
+    if (tokens[0] == NULL)
+        return;
+
+    const char *infile;
+    const char *outfile;
+
+    extract_input_output_redirection(tokens, token_count, &infile, &outfile);
 
     const bool is_background = is_background_command(tokens, &token_count);
 
-    const pid_t exec_line = fork();
-    if (exec_line == -1)
-    {
-        perror("fork");
-        return;
-    }
-
-    // Count non-NULL tokens
+    // Construct argv using tokens
     unsigned int argc = 0;
     for (unsigned int i = 0; i < token_count; i++)
         if (tokens[i] != NULL)
@@ -375,25 +432,19 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     }
     argv[arg_index] = NULL;
 
+    const pid_t exec_line = fork();
+    if (exec_line == -1)
+    {
+        perror("fork");
+        return;
+    }
     // Boy process:
     if (exec_line == 0)
     {
-        if (infile)
-        {
-            if (freopen(infile, "r", stdin) == NULL)
-            {
-                perror("freopen infile");
-                _exit(errno);
-            }
-        }
-        if (outfile)
-        {
-            if (freopen(outfile, "w", stdout) == NULL)
-            {
-                perror("freopen outfile");
-                _exit(errno);
-            }
-        }
+        redirect_standard_streams(infile, outfile);
+
+        if (handle_builtin(tokens, jobs, bgjobs_counter))
+            _exit(EXIT_SUCCESS);
 
         execvp(argv[0], argv);
         perror("execvp");
@@ -401,34 +452,9 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     }
 
     if (is_background)
-    {
-        if (*bgjobs_counter >= MAX_JOBS)
-        {
-            for (int i = 0; i < MAX_JOBS - 1; i++)
-                jobs[i] = jobs[i + 1];
-            (*bgjobs_counter)--;
-        }
-
-        jobs[*bgjobs_counter].pid = exec_line;
-        const char *cmd = (argv[0] != NULL) ? argv[0] : "(null)";
-        strncpy(jobs[*bgjobs_counter].command, cmd, BUFFER_SIZE - 1);
-        jobs[*bgjobs_counter].command[BUFFER_SIZE - 1] = '\0';
-        (*bgjobs_counter)++;
-
-        printf("Started background job \"%s\" with PID %d\n", tokens[0], exec_line);
-        fflush(stdout);
-    } else
-    {
-        int status;
-        waitpid(exec_line, &status, 0);
-        if (WIFEXITED(status))
-        {
-            const int exit_code = WEXITSTATUS(status);
-            if (exit_code != 0)
-                fprintf(stdout, "command exited with status %d\n", exit_code);
-        }
-        fflush(stderr);
-    }
+        handle_bg_job_execution(tokens, jobs, bgjobs_counter, argv, exec_line);
+    else
+        wait_for_process_completion(exec_line);
 
     // Free them
     for (unsigned int i = 0; i < argc; i++)
