@@ -206,6 +206,13 @@ void initialize_user_and_hostname(char username[BUFFER_SIZE], char hostname[BUFF
     hostname[BUFFER_SIZE - 1] = '\0';
 }
 
+static char **prepare_tokens(const char *line, unsigned int *token_count) {
+    static char line_copy[BUFFER_SIZE];
+    strncpy(line_copy, line, BUFFER_SIZE - 1);
+    line_copy[BUFFER_SIZE - 1] = '\0';
+    return tokenizer(line_copy, token_count);
+}
+
 int main(void)
 {
     int bgjobs_counter = 0;
@@ -224,24 +231,24 @@ int main(void)
             printf("%s", prompt);
             free(prompt);
         }
-        // Read line
         fflush(stdout);
+        // Read line
         size_t n = 0;
         if (getline(&line, &n, stdin) == -1)
             break;
 
-
-        char line_copy[BUFFER_SIZE];
-        strncpy(line_copy, line, BUFFER_SIZE - 1);
-        line_copy[BUFFER_SIZE - 1] = '\0';
-
         unsigned int token_count;
-        char **tokens = tokenizer(line_copy, &token_count);
+        char **tokens = prepare_tokens(line, &token_count);
 
         if (handle_builtin(tokens, jobs, &bgjobs_counter))
+        {
+            free(line);
+            line = NULL;
             continue;
+        }
 
         execute_tokens(tokens, token_count, jobs, &bgjobs_counter);
+        fflush(stdout);
         free(line);
         line = NULL;
     }
@@ -255,11 +262,22 @@ char **tokenizer(char *line, unsigned int *token_count)
     *token_count = 0;
 
     char *token = strtok(line, " \t\n");
-    while (token != NULL)
-    {
-        tokens[(*token_count)++] = token;
+    while (token != NULL) {
+        // If a token ends with &, split it
+        const size_t len = strlen(token);
+        if (len > 1 && token[len - 1] == '&') {
+            token[len - 1] = '\0';
+            tokens[*token_count] = token;
+            (*token_count)++;
+            tokens[*token_count] = "&";
+            (*token_count)++;
+        } else {
+            tokens[*token_count] = token;
+            (*token_count)++;
+        }
         token = strtok(NULL, " \t\n");
     }
+
     tokens[*token_count] = NULL;
     return tokens;
 }
@@ -344,10 +362,19 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         jobs[*bgjobs_counter].pid = exec_line;
         strcpy(jobs[*bgjobs_counter].command, tokens[0]);
         (*bgjobs_counter)++;
+
+        printf("Started background job with PID %d\n", exec_line);
+        fflush(stdout);
     } else
     {
         int status;
         waitpid(exec_line, &status, 0);
+        if (WIFEXITED(status))
+        {
+            const int exit_code = WEXITSTATUS(status);
+            if (exit_code != 0)
+                fprintf(stderr, "command exited with status %d\n", exit_code);
+        }
     }
+    fflush(stdout);
 }
-

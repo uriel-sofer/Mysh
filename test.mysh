@@ -1,7 +1,7 @@
 # Minimal test for screenshot
 
 echo Hello from test
-sleep 5 
+sleep 5 &
 mysh nested_script.mysh &
 bgjobs
 bye
