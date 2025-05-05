@@ -1,0 +1,6 @@
+echo From nested mysh
+
+sleep 5 &
+
+sleep 5
+echo Nested script done
