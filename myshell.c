@@ -341,8 +341,8 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     {
         argv[token_count] = NULL;
         execvp(tokens[0], argv);
-        perror("execcvp");
-        exit(errno);
+        perror("execvp");
+        _exit(errno);
     }
 
     // Free them
@@ -363,7 +363,7 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         strcpy(jobs[*bgjobs_counter].command, tokens[0]);
         (*bgjobs_counter)++;
 
-        printf("Started background job with PID %d\n", exec_line);
+        printf("Started background job \"%s\" with PID %d\n", tokens[0] ,exec_line);
         fflush(stdout);
     } else
     {
@@ -373,8 +373,8 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         {
             const int exit_code = WEXITSTATUS(status);
             if (exit_code != 0)
-                fprintf(stderr, "command exited with status %d\n", exit_code);
+                fprintf(stdout, "command exited with status %d\n", exit_code);
         }
+        fflush(stdout);
     }
-    fflush(stdout);
 }
