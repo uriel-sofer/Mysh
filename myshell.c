@@ -103,7 +103,7 @@ static bool handle_kill(char **tokens, bgjob *jobs, int *bgjobs_counter)
         printf("mysh**: invalid PID '%s'\n", tokens[1]);
         return true;
     }
-    const int target_pid = (int)target_pid_long;
+    const int target_pid = (int) target_pid_long;
 
     bool found = false;
 
@@ -171,7 +171,7 @@ static bool handle_mysh(char **tokens, bgjob *jobs, int *bgjobs_counter)
     return true;
 }
 
-char* generate_prompt(const char* username, const char* hostname)
+char *generate_prompt(const char *username, const char *hostname)
 {
     char *cwd = getcwd(NULL, 0);
     if (!cwd) return NULL;
@@ -206,7 +206,8 @@ void initialize_user_and_hostname(char username[BUFFER_SIZE], char hostname[BUFF
     hostname[BUFFER_SIZE - 1] = '\0';
 }
 
-static char **prepare_tokens(const char *line, unsigned int *token_count) {
+static char **prepare_tokens(const char *line, unsigned int *token_count)
+{
     static char line_copy[BUFFER_SIZE];
     strncpy(line_copy, line, BUFFER_SIZE - 1);
     line_copy[BUFFER_SIZE - 1] = '\0';
@@ -262,16 +263,20 @@ char **tokenizer(char *line, unsigned int *token_count)
     *token_count = 0;
 
     char *token = strtok(line, " \t\n");
-    while (token != NULL) {
-        // If a token ends with &, split it
+    while (token != NULL)
+    {
         const size_t len = strlen(token);
-        if (len > 1 && token[len - 1] == '&') {
+        // Handle token ending with &, <, or >
+        if (len > 1 && (token[len - 1] == '&' || token[len - 1] == '<' || token[len - 1] == '>'))
+        {
+            const char last_char = token[len - 1];
             token[len - 1] = '\0';
             tokens[*token_count] = token;
             (*token_count)++;
-            tokens[*token_count] = "&";
+            tokens[*token_count] = (last_char == '&') ? "&" : ((last_char == '<') ? "<" : ">");
             (*token_count)++;
-        } else {
+        } else
+        {
             tokens[*token_count] = token;
             (*token_count)++;
         }
@@ -305,7 +310,7 @@ bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
 
 bool is_background_command(char **tokens, unsigned int *token_count)
 {
-    if (*token_count > 0 && strcmp(tokens[*token_count - 1], "&") == 0)
+    if (*token_count > 0 && tokens[*token_count - 1] && strcmp(tokens[*token_count - 1], "&") == 0)
     {
         tokens[*token_count - 1] = NULL;
         (*token_count)--;
@@ -319,6 +324,29 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     if (tokens[0] == NULL)
         return;
 
+    const char *infile = NULL;
+    const char *outfile = NULL;
+    for (unsigned int i = 0; i + 1 < token_count; i++)
+    {
+        if (tokens[i] && tokens[i + 1])
+        {
+            if (strcmp(tokens[i], "<") == 0)
+            {
+                infile = tokens[i + 1];
+                tokens[i] = NULL;
+                tokens[i + 1] = NULL;
+                i++; // Skip the next token since it's already processed
+            }
+            else if (strcmp(tokens[i], ">") == 0)
+            {
+                outfile = tokens[i + 1];
+                tokens[i] = NULL;
+                tokens[i + 1] = NULL;
+                i++; // Skip the next token since it's already processed
+            }
+        }
+    }
+
     const bool is_background = is_background_command(tokens, &token_count);
 
     const pid_t exec_line = fork();
@@ -328,27 +356,49 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         return;
     }
 
-    // Assign args dynamically
-    char **argv = malloc((token_count + 1) * sizeof(char *));
-    for (int i = 0; i < token_count; i++)
+    // Count non-NULL tokens
+    unsigned int argc = 0;
+    for (unsigned int i = 0; i < token_count; i++)
+        if (tokens[i] != NULL)
+            argc++;
+
+    char **argv = malloc((argc + 1) * sizeof(char *));
+    unsigned int arg_index = 0;
+    for (unsigned int i = 0; i < token_count; i++)
     {
-        argv[i] = malloc(strlen(tokens[i]) + 1);
-        strcpy(argv[i], tokens[i]);
+        if (tokens[i] != NULL)
+        {
+            argv[arg_index] = malloc(strlen(tokens[i]) + 1);
+            strcpy(argv[arg_index], tokens[i]);
+            arg_index++;
+        }
     }
+    argv[arg_index] = NULL;
 
     // Boy process:
     if (exec_line == 0)
     {
-        argv[token_count] = NULL;
-        execvp(tokens[0], argv);
+        if (infile)
+        {
+            if (freopen(infile, "r", stdin) == NULL)
+            {
+                perror("freopen infile");
+                _exit(errno);
+            }
+        }
+        if (outfile)
+        {
+            if (freopen(outfile, "w", stdout) == NULL)
+            {
+                perror("freopen outfile");
+                _exit(errno);
+            }
+        }
+
+        execvp(argv[0], argv);
         perror("execvp");
         _exit(errno);
     }
-
-    // Free them
-    for (unsigned int i = 0; i < token_count; i++)
-        free(argv[i]);
-    free(argv);
 
     if (is_background)
     {
@@ -360,10 +410,12 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         }
 
         jobs[*bgjobs_counter].pid = exec_line;
-        strcpy(jobs[*bgjobs_counter].command, tokens[0]);
+        const char *cmd = (argv[0] != NULL) ? argv[0] : "(null)";
+        strncpy(jobs[*bgjobs_counter].command, cmd, BUFFER_SIZE - 1);
+        jobs[*bgjobs_counter].command[BUFFER_SIZE - 1] = '\0';
         (*bgjobs_counter)++;
 
-        printf("Started background job \"%s\" with PID %d\n", tokens[0] ,exec_line);
+        printf("Started background job \"%s\" with PID %d\n", tokens[0], exec_line);
         fflush(stdout);
     } else
     {
@@ -375,6 +427,11 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
             if (exit_code != 0)
                 fprintf(stdout, "command exited with status %d\n", exit_code);
         }
-        fflush(stdout);
+        fflush(stderr);
     }
+
+    // Free them
+    for (unsigned int i = 0; i < argc; i++)
+        free(argv[i]);
+    free(argv);
 }
