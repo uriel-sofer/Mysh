@@ -24,8 +24,15 @@ typedef struct {
 
 typedef struct stat stats;
 
+typedef enum {
+    BUILTIN_NONE,
+    BUILTIN_HANDLED,
+    BUILTIN_EXIT,
+    BUILTIN_NEEDS_PARENT
+} BuiltinResult;
 
-static bool is_special_char(char c)
+
+static bool is_special_char(const char c)
 {
     return c == '&' || c == '<' || c == '>' || c == '|';
 }
@@ -43,17 +50,20 @@ static bool is_special_char(char c)
 char **tokenizer(char *line, unsigned int *token_count);
 
 /**
- * @brief Handles built-in shell commands.
+ * @brief Determines and executes built-in shell commands if matched.
  *
- * This function checks if the first token corresponds to a recognized built-in command
- * like "bye", "bgjobs", "kill", or "mysh". If it matches, the command is executed internally.
+ * This function checks if the first token matches a built-in command (e.g., cd, exit, bgjobs).
+ * If so, it executes the built-in and returns an enum indicating how the shell should proceed.
  *
- * @param tokens Array of command tokens (first token is the command).
- * @param jobs Array for all the bg jobs
- * @param bgjobs_counter counter of current bg jobs running
- * @return true if a built-in command was handled, false otherwise.
+ * This must be called both in the parent shell and in child processes to determine if exec should proceed.
+ * Certain built-ins like `cd` and `exit` must only be executed in the parent context.
+ *
+ * @param tokens Tokenized input line.
+ * @param jobs Background job array.
+ * @param bgjobs_counter Pointer to background job count.
+ * @return A BuiltinResult enum describing how the built-in was handled.
  */
-bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter);
+BuiltinResult handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter);
 
 /**
  * @brief Executes a parsed command from tokens, handling background and foreground jobs.
@@ -160,7 +170,10 @@ static bool handle_mysh(char **tokens, bgjob *jobs, int *bgjobs_counter)
 
             if (inner_tokens[0] != NULL)
             {
-                if (handle_builtin(inner_tokens, jobs, bgjobs_counter))
+                const BuiltinResult result = handle_builtin(tokens, jobs, bgjobs_counter);
+                if (result == BUILTIN_EXIT)
+                    break;
+                if (result == BUILTIN_NEEDS_PARENT || result == BUILTIN_HANDLED)
                     continue;
 
                 execute_tokens(inner_tokens, token_count, jobs, bgjobs_counter);
@@ -173,12 +186,37 @@ static bool handle_mysh(char **tokens, bgjob *jobs, int *bgjobs_counter)
     return true;
 }
 
-static bool is_exit_builtin(char** tokens)
+static bool handle_cd(char** tokens)
 {
-    return tokens[0] && (strcmp(tokens[0], "exit") == 0 || strcmp(tokens[0], "bye") == 0);
+    const char* target_path = tokens[1];
+
+    if (target_path == NULL)
+    {
+        // No argument: go HOME
+        target_path = getenv("HOME");
+        if (!target_path)
+        {
+            fprintf(stderr, "cd: HOME not set\n");
+            return true;
+        }
+    }
+
+    if (chdir(target_path) != 0)
+        perror("cd");
+
+    return true;
 }
 
-
+/**
+ * @brief Builds the shell prompt string dynamically based on the user and current directory.
+ *
+ * The prompt format is: user@hostname current_dir mysh~~>
+ * This function allocates memory for the prompt; the caller must free it.
+ *
+ * @param username The current user's name.
+ * @param hostname The system's hostname.
+ * @return A malloc allocated string containing the prompt, or NULL on failure.
+ */
 char *generate_prompt(const char *username, const char *hostname)
 {
     char *cwd = getcwd(NULL, 0);
@@ -232,19 +270,19 @@ int main(void)
     char hostname[BUFFER_SIZE];
     initialize_user_and_hostname(username, hostname);
 
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     while (true)
     {
         fflush(stdout);
         fflush(stderr);
-
         char *prompt = generate_prompt(username, hostname);
+
         if (prompt)
         {
             printf("%s", prompt);
             free(prompt);
         }
-        fflush(stdout);
-        fflush(stderr);
         // Read line
         size_t n = 0;
         if (getline(&line, &n, stdin) == -1)
@@ -253,13 +291,14 @@ int main(void)
         unsigned int token_count;
         char **tokens = prepare_tokens(line, &token_count);
 
-        if (is_exit_builtin(tokens))
-        {
-            handle_builtin(tokens, jobs, &bgjobs_counter);
+        const BuiltinResult result = handle_builtin(tokens, jobs, &bgjobs_counter);
+        if (result == BUILTIN_EXIT)
             break;
-        }
+        if (result == BUILTIN_NEEDS_PARENT || result == BUILTIN_HANDLED)
+            continue;
 
         execute_tokens(tokens, token_count, jobs, &bgjobs_counter);
+
         fflush(stdout);
         fflush(stderr);
         free(line);
@@ -302,25 +341,38 @@ char **tokenizer(char *line, unsigned int *token_count)
     return tokens;
 }
 
-bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
+BuiltinResult handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
 {
     if (tokens[0] == NULL)
-        return false;
+        return BUILTIN_NONE;
 
     if (strcmp(tokens[0], "exit") == 0 || strcmp(tokens[0], "bye") == 0)
-        return handle_bye(jobs, bgjobs_counter);
-
+    {
+        handle_bye(jobs, bgjobs_counter);
+        return BUILTIN_EXIT;
+    }
+    if (strcmp(tokens[0], "cd") == 0)
+    {
+        handle_cd(tokens);
+        return BUILTIN_NEEDS_PARENT;
+    }
     if (strcmp(tokens[0], "bgjobs") == 0)
-        return handle_bgjobs(jobs, bgjobs_counter);
-
+    {
+        handle_bgjobs(jobs, bgjobs_counter);
+        return BUILTIN_HANDLED;
+    }
     if (strcmp(tokens[0], "kill") == 0)
-        return handle_kill(tokens, jobs, bgjobs_counter);
-
+    {
+        handle_kill(tokens, jobs, bgjobs_counter);
+        return BUILTIN_HANDLED;
+    }
     if (strcmp(tokens[0], "mysh") == 0)
-        return handle_mysh(tokens, jobs, bgjobs_counter);
+    {
+        handle_mysh(tokens, jobs, bgjobs_counter);
+        return BUILTIN_HANDLED;
+    }
 
-
-    return false;
+    return BUILTIN_NONE;
 }
 
 bool is_background_command(char **tokens, unsigned int *token_count)
@@ -334,6 +386,21 @@ bool is_background_command(char **tokens, unsigned int *token_count)
     return false;
 }
 
+/**
+ * @brief Splits a token array into segments separated by pipes.
+ *
+ * This function scans the token array for the '|' token. Each segment is a sequence of tokens between pipes,
+ * where '|' tokens are replaced with NULL to terminate subarrays. The returned structure holds pointers to
+ * each command segment and the count of segments.
+ *
+ * Note: The caller must free the returned segments array. The input `tokens` array is modified in-place.
+ *
+ * @param tokens The original token array (will be modified).
+ * @param token_count The number of tokens in the input.
+ * @param jobs Background jobs list (not used here, but passed for interface consistency).
+ * @param bgjobs_counter Counter for background jobs (not used here).
+ * @return A PipedSegments struct containing token subarrays and count.
+ */
 static PipedSegments pipes_segmentation(char **tokens, const unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
 {
     unsigned int pipe_count = 0;
@@ -351,14 +418,16 @@ static PipedSegments pipes_segmentation(char **tokens, const unsigned int token_
         }
         single_segment[0] = tokens;
         single_segment[1] = NULL;
+        // Defensive: if this function ever needs to free single_segment before return, do so here.
+        // (Currently, no intermediate allocations to free here.)
         return (PipedSegments) { .segments = single_segment, .count = 1 };
     }
 
     const unsigned int segments_count = pipe_count + 1;
-    char*** segments = calloc(segments_count, sizeof(char**)); // Still memory warning
-    if (!segments)
+    char ***segments = calloc(segments_count, sizeof(char **));
+    if (segments == NULL)
     {
-        perror("malloc");
+        perror("calloc");
         _exit(errno);
     }
 
@@ -426,7 +495,18 @@ void redirect_standard_streams(const char *infile, const char *outfile)
     }
 }
 
-// After background child fork
+/**
+ * @brief Registers a new background job in the shell.
+ *
+ * If the background job list is full, it discards the oldest job.
+ * This function stores the PID and command of the background job and prints its creation info.
+ *
+ * @param tokens The original tokens used to build the job description.
+ * @param jobs The array of background jobs.
+ * @param bgjobs_counter Pointer to the job count (will be incremented).
+ * @param argv Cleaned argument array (argv[0] is used as the command name).
+ * @param exec_line The PID of the newly forked background process.
+ */
 void handle_bg_job_execution(char **tokens, bgjob *jobs, int *bgjobs_counter, char **argv, const pid_t exec_line)
 {
     if (*bgjobs_counter >= MAX_JOBS)
@@ -498,10 +578,15 @@ static char** argv_construction(const char** tokens, const unsigned int token_co
 }
 
 /**
- * Attaches pipes if needed: attaches the read end if '|' is before, and attaches the writing end if '|' is after.
- * @param segments segments between the pipes, each is a command
- * @param pipe_fds arrays to be piped()
- * @param i the index of the command in the segment chain
+ * @brief Configures stdin/stdout of a child process based on its position in a pipeline.
+ *
+ * If the process is not the first in the pipeline, stdin is redirected from the previous pipe.
+ * If the process is not the last in the pipeline, stdout is redirected to the next pipe.
+ * All pipe file descriptors are closed afterward to prevent leaks.
+ *
+ * @param segments Structure describing all piped command segments.
+ * @param pipe_fds The full array of pipe file descriptors (read/write pairs).
+ * @param i The index of the current command in the pipeline sequence.
  */
 void configure_process_io(const PipedSegments segments, int pipe_fds[], const unsigned int i)
 {
@@ -558,9 +643,10 @@ void execute_piped_commands(bgjob *jobs, int *bgjobs_counter, const PipedSegment
             char** argv = argv_construction(segments.segments[i], arg_count);
             if (!argv)  _exit(EXIT_FAILURE);
 
-            if (handle_builtin(segments.segments[i], jobs, bgjobs_counter))
+            const BuiltinResult result = handle_builtin(segments.segments[i], jobs, bgjobs_counter);
+            if (result == BUILTIN_NEEDS_PARENT || result == BUILTIN_EXIT)
             {
-                // Free argv before exit
+                // Built-in must be handled by parent or terminate shell — skip in child
                 for (char **p = argv; *p != NULL; ++p)
                     free(*p);
                 free(argv);
@@ -571,6 +657,10 @@ void execute_piped_commands(bgjob *jobs, int *bgjobs_counter, const PipedSegment
             // Debug print on exec failure
             fprintf(stderr, "Failed to exec: %s\n", argv[0]);
             perror("execvp");
+
+            fflush(stderr);
+            fflush(stdout);
+
             // Free argv before exit
             for (char **p = argv; *p != NULL; ++p)
                 free(*p);
@@ -596,6 +686,10 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     {
         execute_piped_commands(jobs, bgjobs_counter, segments);
         return;
+    }
+    else
+    {
+        free(segments.segments);
     }
 
     if (tokens[0] == NULL)
@@ -627,7 +721,8 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     {
         redirect_standard_streams(infile, outfile);
 
-        if (handle_builtin(tokens, jobs, bgjobs_counter))
+        const BuiltinResult result = handle_builtin(tokens, jobs, bgjobs_counter);
+        if (result == BUILTIN_EXIT || result == BUILTIN_NEEDS_PARENT || result == BUILTIN_HANDLED)
         {
             for (char **p = argv; *p != NULL; ++p)
                 free(*p);
@@ -637,6 +732,10 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
 
         execvp(argv[0], argv);
         perror("execvp");
+
+        fflush(stderr);
+        fflush(stdout);
+
         for (char **p = argv; *p != NULL; ++p)
             free(*p);
         free(argv);
