@@ -37,6 +37,13 @@ static bool is_special_char(const char c)
     return c == '&' || c == '<' || c == '>' || c == '|';
 }
 
+static bool is_special_token(const char *token)
+{
+    return token &&
+           strlen(token) == 1 &&
+           (is_special_char(token[0]) || strcmp(token, ">>") == 0);
+}
+
 /**
  * @brief Tokenizes a given input line into separate words.
  *
@@ -317,6 +324,27 @@ char **tokenizer(char *line, unsigned int *token_count)
     while (token != NULL)
     {
         const size_t len = strlen(token);
+
+        // Use strstr to detect and split ">>" in the token
+        char *pos = strstr(token, ">>");
+        if (pos)
+        {
+            if (pos != token)
+            {
+                *pos = '\0';
+                tokens[(*token_count)++] = token;
+            }
+
+            tokens[(*token_count)++] = ">>";
+
+            char *after = pos + 2;
+            if (*after)
+                tokens[(*token_count)++] = after;
+
+            token = strtok(NULL, " \t\n");
+            continue;
+        }
+
         // Handle token ending with &, <, >, or |
         if (len > 1 && is_special_char(token[len - 1]))
         {
@@ -329,7 +357,8 @@ char **tokenizer(char *line, unsigned int *token_count)
                 (last_char == '<') ? "<" :
                 (last_char == '>') ? ">" : "|";
             (*token_count)++;
-        } else
+        }
+        else
         {
             tokens[*token_count] = token;
             (*token_count)++;
@@ -448,7 +477,7 @@ static PipedSegments pipes_segmentation(char **tokens, const unsigned int token_
 }
 
 // Used when tokenizing
-void extract_input_output_redirection(char **tokens, const unsigned int token_count, const char **infile, const char **outfile)
+void extract_input_output_redirection(char **tokens, const unsigned int token_count, const char **infile, const char **outfile, bool* append)
 {
     *infile = NULL;
     *outfile = NULL;
@@ -463,8 +492,9 @@ void extract_input_output_redirection(char **tokens, const unsigned int token_co
                 tokens[i + 1] = NULL;
                 i++; // Skip the next token since it's already processed
             }
-            else if (strcmp(tokens[i], ">") == 0)
+            else if (strcmp(tokens[i], ">") == 0 || strcmp(tokens[i], ">>") == 0)
             {
+                *append = (strcmp(tokens[i], ">>") == 0);
                 *outfile = tokens[i + 1];
                 tokens[i] = NULL;
                 tokens[i + 1] = NULL;
@@ -475,7 +505,7 @@ void extract_input_output_redirection(char **tokens, const unsigned int token_co
 }
 
 // Used when executing children
-void redirect_standard_streams(const char *infile, const char *outfile)
+void redirect_standard_streams(const char *infile, const char *outfile, const bool append)
 {
     if (infile)
     {
@@ -487,10 +517,21 @@ void redirect_standard_streams(const char *infile, const char *outfile)
     }
     if (outfile)
     {
-        if (freopen(outfile, "w", stdout) == NULL)
+        if (append)
         {
-            perror("freopen outfile");
-            _exit(errno);
+            if (freopen(outfile, "a", stdout) == NULL)
+            {
+                perror("freopen outfile");
+                _exit(errno);
+            }
+        }
+        else
+        {
+            if (freopen(outfile, "w", stdout) == NULL)
+            {
+                perror("freopen outfile");
+                _exit(errno);
+            }
         }
     }
 }
@@ -550,7 +591,7 @@ static char** argv_construction(const char** tokens, const unsigned int token_co
 {
     unsigned int argc = 0;
     for (unsigned int i = 0; i < token_count; i++)
-        if (tokens[i] != NULL)
+        if (tokens[i] != NULL && !is_special_token(tokens[i]))
             argc++;
 
     char **argv = malloc((argc + 1) * sizeof(char *));
@@ -559,7 +600,7 @@ static char** argv_construction(const char** tokens, const unsigned int token_co
     unsigned int arg_index = 0;
     for (unsigned int i = 0; i < token_count; i++)
     {
-        if (tokens[i] != NULL)
+        if (tokens[i] != NULL && !is_special_token(tokens[i]))
         {
             argv[arg_index] = malloc(strlen(tokens[i]) + 1);
             if (!argv[arg_index])
@@ -634,11 +675,12 @@ void execute_piped_commands(bgjob *jobs, int *bgjobs_counter, const PipedSegment
 
             const char *infile = NULL;
             const char *outfile = NULL;
-            extract_input_output_redirection(segments.segments[i], arg_count, &infile, &outfile);
+            bool append = false;
+            extract_input_output_redirection(segments.segments[i], arg_count, &infile, &outfile, &append);
 
             configure_process_io(segments, pipe_fds, i);
 
-            redirect_standard_streams(infile, outfile);
+            redirect_standard_streams(infile, outfile, append);
 
             char** argv = argv_construction(segments.segments[i], arg_count);
             if (!argv)  _exit(EXIT_FAILURE);
@@ -683,14 +725,9 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     const PipedSegments segments = pipes_segmentation(tokens, token_count, jobs, bgjobs_counter);
 
     if (segments.count > 1)
-    {
         execute_piped_commands(jobs, bgjobs_counter, segments);
-        return;
-    }
     else
-    {
         free(segments.segments);
-    }
 
     if (tokens[0] == NULL)
         return;
@@ -698,7 +735,8 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     const char *infile;
     const char *outfile;
 
-    extract_input_output_redirection(tokens, token_count, &infile, &outfile);
+    bool append = false;
+    extract_input_output_redirection(tokens, token_count, &infile, &outfile, &append);
 
     const bool is_background = is_background_command(tokens, &token_count);
 
@@ -719,7 +757,7 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     // Boy process:
     if (child_pid == 0)
     {
-        redirect_standard_streams(infile, outfile);
+        redirect_standard_streams(infile, outfile, append);
 
         const BuiltinResult result = handle_builtin(tokens, jobs, bgjobs_counter);
         if (result == BUILTIN_EXIT || result == BUILTIN_NEEDS_PARENT || result == BUILTIN_HANDLED)
