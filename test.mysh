@@ -1,7 +1,30 @@
-# Minimal test for screenshot
+# This is a test script for mysh
+echo Starting shell test
+echo ----------------------
 
-echo Hello from test
-sleep 5 &
-mysh nested_script.mysh &
+# Background job test
+sleep 2 &
+sleep 1 &
 bgjobs
+
+# Test input/output redirection
+echo echoing apples to file
+echo apple > fruits.txt
+echo from file:
+cat < fruits.txt
+
+# Pipeline test
+echo hello world | wc -w
+
+# Combined redirection and pipeline
+cat < unsorted.txt | sort > sorted.txt
+cat sorted.txt
+
+# Internal command
+mysh nested_script.mysh
+
+# Invalid command
+nocommanddoesnotexist
+
+# Built-in exit
 bye

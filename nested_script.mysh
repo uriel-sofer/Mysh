@@ -1,6 +1,4 @@
-echo From nested mysh
-
-sleep 5 &
-
-sleep 5&
-echo Nested script done
+# nested_test.mysh - Called from test_basic.mysh
+echo This is a nested script
+echo It should also execute fine > nested_output.txt
+cat < nested_output.txt

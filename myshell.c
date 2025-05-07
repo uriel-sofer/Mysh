@@ -17,7 +17,18 @@ typedef struct bgjob {
     char command[BUFFER_SIZE];
 } bgjob;
 
+typedef struct {
+    char ***segments;       // Array of segments (each a NULL-terminated argv)
+    unsigned int count;     // Number of segments
+} PipedSegments;
+
 typedef struct stat stats;
+
+
+static bool is_special_char(char c)
+{
+    return c == '&' || c == '<' || c == '>' || c == '|';
+}
 
 /**
  * @brief Tokenizes a given input line into separate words.
@@ -59,15 +70,6 @@ bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter);
  */
 void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *bgjobs_counter);
 
-/**
- * @brief Checks if the command should run in the background.
- *
- * If the last token is "&", removes it and signals background execution.
- *
- * @param tokens The array of tokens.
- * @param token_count Pointer to the count of tokens (might be updated).
- * @return true if background execution is requested, false otherwise.
- */
 bool is_background_command(char **tokens, unsigned int *token_count);
 
 /* BUILT-IN COMMANDS (helper functions) */
@@ -176,6 +178,7 @@ static bool is_exit_builtin(char** tokens)
     return tokens[0] && (strcmp(tokens[0], "exit") == 0 || strcmp(tokens[0], "bye") == 0);
 }
 
+
 char *generate_prompt(const char *username, const char *hostname)
 {
     char *cwd = getcwd(NULL, 0);
@@ -231,6 +234,9 @@ int main(void)
 
     while (true)
     {
+        fflush(stdout);
+        fflush(stderr);
+
         char *prompt = generate_prompt(username, hostname);
         if (prompt)
         {
@@ -238,6 +244,7 @@ int main(void)
             free(prompt);
         }
         fflush(stdout);
+        fflush(stderr);
         // Read line
         size_t n = 0;
         if (getline(&line, &n, stdin) == -1)
@@ -249,12 +256,12 @@ int main(void)
         if (is_exit_builtin(tokens))
         {
             handle_builtin(tokens, jobs, &bgjobs_counter);
-            free(line);
-            return 0;
+            break;
         }
 
         execute_tokens(tokens, token_count, jobs, &bgjobs_counter);
         fflush(stdout);
+        fflush(stderr);
         free(line);
         line = NULL;
     }
@@ -271,14 +278,17 @@ char **tokenizer(char *line, unsigned int *token_count)
     while (token != NULL)
     {
         const size_t len = strlen(token);
-        // Handle token ending with &, <, or >
-        if (len > 1 && (token[len - 1] == '&' || token[len - 1] == '<' || token[len - 1] == '>'))
+        // Handle token ending with &, <, >, or |
+        if (len > 1 && is_special_char(token[len - 1]))
         {
             const char last_char = token[len - 1];
             token[len - 1] = '\0';
             tokens[*token_count] = token;
             (*token_count)++;
-            tokens[*token_count] = (last_char == '&') ? "&" : ((last_char == '<') ? "<" : ">");
+            tokens[*token_count] =
+                (last_char == '&') ? "&" :
+                (last_char == '<') ? "<" :
+                (last_char == '>') ? ">" : "|";
             (*token_count)++;
         } else
         {
@@ -309,6 +319,7 @@ bool handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
     if (strcmp(tokens[0], "mysh") == 0)
         return handle_mysh(tokens, jobs, bgjobs_counter);
 
+
     return false;
 }
 
@@ -323,7 +334,52 @@ bool is_background_command(char **tokens, unsigned int *token_count)
     return false;
 }
 
-void extract_input_output_redirection(char **tokens, unsigned int token_count, const char **infile, const char **outfile)
+static PipedSegments pipes_segmentation(char **tokens, const unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
+{
+    unsigned int pipe_count = 0;
+    for (unsigned int i = 0; i < token_count; i++)
+        if (tokens[i] && strcmp(tokens[i], "|") == 0)
+            pipe_count++;
+
+    if (pipe_count == 0)
+    {
+        char ***single_segment = malloc(2 * sizeof(char **));
+        if (!single_segment)
+        {
+            perror("malloc");
+            _exit(errno);
+        }
+        single_segment[0] = tokens;
+        single_segment[1] = NULL;
+        return (PipedSegments) { .segments = single_segment, .count = 1 };
+    }
+
+    const unsigned int segments_count = pipe_count + 1;
+    char*** segments = calloc(segments_count, sizeof(char**)); // Still memory warning
+    if (!segments)
+    {
+        perror("malloc");
+        _exit(errno);
+    }
+
+    unsigned int seg_idx = 0;
+    segments[seg_idx++] = tokens;
+
+    for (unsigned int i = 0; i < token_count; i++)
+    {
+        if (tokens[i] && strcmp(tokens[i], "|") == 0)
+        {
+            tokens[i] = NULL;
+            if (i + 1 < token_count)
+                segments[seg_idx++] = &tokens[i + 1];
+        }
+    }
+
+    return (PipedSegments) { .segments = segments, .count = segments_count };
+}
+
+// Used when tokenizing
+void extract_input_output_redirection(char **tokens, const unsigned int token_count, const char **infile, const char **outfile)
 {
     *infile = NULL;
     *outfile = NULL;
@@ -349,6 +405,7 @@ void extract_input_output_redirection(char **tokens, unsigned int token_count, c
     }
 }
 
+// Used when executing children
 void redirect_standard_streams(const char *infile, const char *outfile)
 {
     if (infile)
@@ -369,6 +426,7 @@ void redirect_standard_streams(const char *infile, const char *outfile)
     }
 }
 
+// After background child fork
 void handle_bg_job_execution(char **tokens, bgjob *jobs, int *bgjobs_counter, char **argv, const pid_t exec_line)
 {
     if (*bgjobs_counter >= MAX_JOBS)
@@ -388,7 +446,8 @@ void handle_bg_job_execution(char **tokens, bgjob *jobs, int *bgjobs_counter, ch
     fflush(stdout);
 }
 
-void wait_for_process_completion(const pid_t exec_line)
+// After foreground child fork
+void wait_for_process_completion(const char* cmd, const pid_t exec_line)
 {
     int status;
     waitpid(exec_line, &status, 0);
@@ -396,13 +455,149 @@ void wait_for_process_completion(const pid_t exec_line)
     {
         const int exit_code = WEXITSTATUS(status);
         if (exit_code != 0)
-            fprintf(stdout, "command exited with status %d\n", exit_code);
+            fprintf(stdout, "command not found: %s\nexited with status %d\n", cmd, exit_code);
     }
     fflush(stderr);
 }
 
+/**
+ * Constructs a clean argv array for execvp command by nullifying irrelevant tokens like <, >, |, &
+ * @param tokens tokens from the parsed line
+ * @param token_count number of tokens
+ * @return a clean argv array to send to exec command
+ **/
+static char** argv_construction(const char** tokens, const unsigned int token_count)
+{
+    unsigned int argc = 0;
+    for (unsigned int i = 0; i < token_count; i++)
+        if (tokens[i] != NULL)
+            argc++;
+
+    char **argv = malloc((argc + 1) * sizeof(char *));
+    if (!argv) return NULL;
+
+    unsigned int arg_index = 0;
+    for (unsigned int i = 0; i < token_count; i++)
+    {
+        if (tokens[i] != NULL)
+        {
+            argv[arg_index] = malloc(strlen(tokens[i]) + 1);
+            if (!argv[arg_index])
+            {
+                for (unsigned int j = 0; j < arg_index; j++)
+                    free(argv[j]);
+                free(argv);
+                return NULL;
+            }
+            strcpy(argv[arg_index], tokens[i]);
+            arg_index++;
+        }
+    }
+    argv[arg_index] = NULL;
+    return argv;
+}
+
+/**
+ * Attaches pipes if needed: attaches the read end if '|' is before, and attaches the writing end if '|' is after.
+ * @param segments segments between the pipes, each is a command
+ * @param pipe_fds arrays to be piped()
+ * @param i the index of the command in the segment chain
+ */
+void configure_process_io(const PipedSegments segments, int pipe_fds[], const unsigned int i)
+{
+    // If not the first command, attach stdin to the previous
+    if (i > 0)
+        dup2(pipe_fds[(i - 1) * 2], STDIN_FILENO);
+
+    // If not the last command, attach stdout to the next
+    if (i < segments.count - 1)
+        dup2(pipe_fds[i * 2 + 1], STDOUT_FILENO);
+
+    // Close the other fds
+    for (unsigned int j = 0; j < 2 * (segments.count - 1); j++)
+        close(pipe_fds[j]);
+}
+
+void execute_piped_commands(bgjob *jobs, int *bgjobs_counter, const PipedSegments segments)
+{
+    int pipe_fds[2 * segments.count - 1];
+    for (unsigned int i = 0; i < segments.count - 1; i++)
+    {
+        // Open pipes
+        if (pipe(pipe_fds + i * 2) == -1)
+        {
+            perror("pipe");
+            _exit(errno);
+        }
+    }
+
+    for (unsigned int i = 0; i < segments.count; i++)
+    {
+        const pid_t child_pid = fork();
+        if (child_pid == -1)
+        {
+            perror("fork");
+            _exit(errno);
+        }
+
+        if (child_pid == 0)
+        {
+            // Boy process
+            unsigned int arg_count = 0;
+            while (segments.segments[i][arg_count] != NULL)
+                arg_count++;
+
+            const char *infile = NULL;
+            const char *outfile = NULL;
+            extract_input_output_redirection(segments.segments[i], arg_count, &infile, &outfile);
+
+            configure_process_io(segments, pipe_fds, i);
+
+            redirect_standard_streams(infile, outfile);
+
+            char** argv = argv_construction(segments.segments[i], arg_count);
+            if (!argv)  _exit(EXIT_FAILURE);
+
+            if (handle_builtin(segments.segments[i], jobs, bgjobs_counter))
+            {
+                // Free argv before exit
+                for (char **p = argv; *p != NULL; ++p)
+                    free(*p);
+                free(argv);
+                _exit(EXIT_SUCCESS);
+            }
+
+            execvp(argv[0], argv);
+            // Debug print on exec failure
+            fprintf(stderr, "Failed to exec: %s\n", argv[0]);
+            perror("execvp");
+            // Free argv before exit
+            for (char **p = argv; *p != NULL; ++p)
+                free(*p);
+            free(argv);
+            _exit(errno);
+        }
+    }
+
+    for (unsigned int i = 0; i < 2*(segments.count - 1); i++)
+        close(pipe_fds[i]);
+
+    for (unsigned int i = 0; i < segments.count; i++)
+        wait(NULL);
+    // Free segments.segments before returning
+    free(segments.segments);
+}
+
 void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
 {
+    const PipedSegments segments = pipes_segmentation(tokens, token_count, jobs, bgjobs_counter);
+
+    if (segments.count > 1)
+    {
+        execute_piped_commands(jobs, bgjobs_counter, segments);
+        return;
+    }
+
     if (tokens[0] == NULL)
         return;
 
@@ -413,51 +608,48 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
 
     const bool is_background = is_background_command(tokens, &token_count);
 
-    // Construct argv using tokens
-    unsigned int argc = 0;
-    for (unsigned int i = 0; i < token_count; i++)
-        if (tokens[i] != NULL)
-            argc++;
+    char** argv = argv_construction(tokens, token_count);
+    if (!argv)  return;
 
-    char **argv = malloc((argc + 1) * sizeof(char *));
-    unsigned int arg_index = 0;
-    for (unsigned int i = 0; i < token_count; i++)
-    {
-        if (tokens[i] != NULL)
-        {
-            argv[arg_index] = malloc(strlen(tokens[i]) + 1);
-            strcpy(argv[arg_index], tokens[i]);
-            arg_index++;
-        }
-    }
-    argv[arg_index] = NULL;
-
-    const pid_t exec_line = fork();
-    if (exec_line == -1)
+    const pid_t child_pid = fork();
+    if (child_pid == -1)
     {
         perror("fork");
+        // Free argv and its contents
+        for (char **p = argv; *p != NULL; ++p)
+            free(*p);
+        free(argv);
         return;
     }
+
     // Boy process:
-    if (exec_line == 0)
+    if (child_pid == 0)
     {
         redirect_standard_streams(infile, outfile);
 
         if (handle_builtin(tokens, jobs, bgjobs_counter))
+        {
+            for (char **p = argv; *p != NULL; ++p)
+                free(*p);
+            free(argv);
             _exit(EXIT_SUCCESS);
+        }
 
         execvp(argv[0], argv);
         perror("execvp");
+        for (char **p = argv; *p != NULL; ++p)
+            free(*p);
+        free(argv);
         _exit(errno);
     }
 
     if (is_background)
-        handle_bg_job_execution(tokens, jobs, bgjobs_counter, argv, exec_line);
+        handle_bg_job_execution(tokens, jobs, bgjobs_counter, argv, child_pid);
     else
-        wait_for_process_completion(exec_line);
+        wait_for_process_completion(argv[0], child_pid);
 
-    // Free them
-    for (unsigned int i = 0; i < argc; i++)
-        free(argv[i]);
+    // Free argv and its contents
+    for (char **p = argv; *p != NULL; ++p)
+        free(*p);
     free(argv);
 }
