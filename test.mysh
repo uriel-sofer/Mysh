@@ -16,18 +16,36 @@ echo apple > fruits.txt
 echo from file:
 cat < fruits.txt
 
+echo --- Append Redirection ---
+echo banana >> fruits.txt
+echo cherry >> fruits.txt
+cat fruits.txt
+
 echo --- Pipeline Test ---
 echo hello world | wc -w
 
+echo --- Pipe Without Spaces ---
+echo one two three|wc -w
+
 echo --- Combined Redirection and Pipeline ---
-cat < unsorted.txt | sort > sorted.txt
+cat < fruits.txt | sort > sorted.txt
 cat sorted.txt
+
+echo --- Redirection Without Spaces ---
+echo peach>fruits.txt
+cat<fruits.txt
 
 echo --- Nested Script Execution ---
 mysh nested_script.mysh
 
 echo --- Invalid Command Test ---
 nocommanddoesnotexist
+
+echo --- Invalid Redirection Syntax ---
+echo oops >
+
+echo --- Invalid Pipe with Built-in ---
+bgjobs | wc -l
 
 echo --- Exiting Shell ---
 echo === Finished test script: test.mysh ===

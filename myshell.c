@@ -8,6 +8,16 @@
 #include <signal.h>
 #include <sys/errno.h>
 
+#define safe_free(p) do { if ((p) != NULL) { free(p); (p) = NULL; } } while (0)
+
+void free_string_array(char **arr)
+{
+    if (!arr) return;
+    for (char **p = arr; *p != NULL; ++p)
+        free(*p);
+    free(arr);
+}
+
 #define MAX_JOBS 10 // Tracked background jobs
 #define BUFFER_SIZE 1024
 #define PROMPT_SUFFIX "mysh~~> "
@@ -317,21 +327,37 @@ int main(void)
 
 char **tokenizer(char *line, unsigned int *token_count)
 {
-    static char *tokens[BUFFER_SIZE];
-    *token_count = 0;
+    size_t capacity = 16;
+    char **tokens = malloc(capacity * sizeof(char *));
+    if (!tokens) return NULL;
 
+    *token_count = 0;
     char *token = strtok(line, " \t\n");
     while (token != NULL)
     {
-        const size_t len = strlen(token);
+        size_t len = strlen(token);
         size_t start = 0;
 
         while (start < len)
         {
+            if (*token_count + 1 >= capacity)
+            {
+                capacity *= 2;
+                char **temp = realloc(tokens, capacity * sizeof(char *));
+                if (!temp)
+                {
+                    for (unsigned int i = 0; i < *token_count; i++)
+                        free(tokens[i]);
+                    free(tokens);
+                    return NULL;
+                }
+                tokens = temp;
+            }
+
             // Handle >>
             if (token[start] == '>' && token[start + 1] == '>')
             {
-                tokens[(*token_count)++] = ">>";
+                tokens[(*token_count)++] = strdup(">>");
                 start += 2;
                 continue;
             }
@@ -348,13 +374,13 @@ char **tokenizer(char *line, unsigned int *token_count)
             }
 
             // Handle normal word until the next special char
-            const size_t word_start = start;
+            size_t word_start = start;
             while (start < len && !is_special_char(token[start]))
                 start++;
 
             if (start > word_start)
             {
-                const char backup = token[start];
+                char backup = token[start];
                 token[start] = '\0';
                 tokens[(*token_count)++] = strdup(token + word_start);
                 token[start] = backup;
@@ -364,13 +390,13 @@ char **tokenizer(char *line, unsigned int *token_count)
         token = strtok(NULL, " \t\n");
     }
 
-    tokens[*token_count] = NULL;
+    tokens[(*token_count)] = NULL;
     return tokens;
 }
 
 BuiltinResult handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
 {
-    if (tokens[0] == NULL)
+    if (!tokens || tokens[0] == NULL)
         return BUILTIN_NONE;
 
     if (strcmp(tokens[0], "exit") == 0 || strcmp(tokens[0], "bye") == 0)
@@ -404,6 +430,9 @@ BuiltinResult handle_builtin(char **tokens, bgjob *jobs, int *bgjobs_counter)
 
 bool is_background_command(char **tokens, unsigned int *token_count)
 {
+    if (!tokens)
+        return false;
+
     if (*token_count > 0 && tokens[*token_count - 1] && strcmp(tokens[*token_count - 1], "&") == 0)
     {
         tokens[*token_count - 1] = NULL;
@@ -430,6 +459,9 @@ bool is_background_command(char **tokens, unsigned int *token_count)
  */
 static PipedSegments pipes_segmentation(char **tokens, const unsigned int token_count, bgjob *jobs, int *bgjobs_counter)
 {
+    if (!tokens)
+        return (PipedSegments) { .segments = NULL, .count = 0 };
+
     unsigned int pipe_count = 0;
     for (unsigned int i = 0; i < token_count; i++)
         if (tokens[i] && strcmp(tokens[i], "|") == 0)
@@ -524,6 +556,7 @@ void redirect_standard_streams(const char *infile, const char *outfile, const bo
         if (freopen(infile, "r", stdin) == NULL)
         {
             perror("freopen infile");
+            fprintf(stderr, "failed to open file '%s'\n", infile);
             _exit(errno);
         }
     }
@@ -617,9 +650,7 @@ static char** argv_construction(const char** tokens, const unsigned int token_co
             argv[arg_index] = malloc(strlen(tokens[i]) + 1);
             if (!argv[arg_index])
             {
-                for (unsigned int j = 0; j < arg_index; j++)
-                    free(argv[j]);
-                free(argv);
+                free_string_array(argv);
                 return NULL;
             }
             strcpy(argv[arg_index], tokens[i]);
@@ -701,24 +732,18 @@ void execute_piped_commands(bgjob *jobs, int *bgjobs_counter, const PipedSegment
             if (result == BUILTIN_NEEDS_PARENT || result == BUILTIN_EXIT)
             {
                 // Built-in must be handled by parent or terminate shell — skip in child
-                for (char **p = argv; *p != NULL; ++p)
-                    free(*p);
-                free(argv);
+                free_string_array(argv);
                 _exit(EXIT_SUCCESS);
             }
 
             execvp(argv[0], argv);
-            // Debug print on exec failure
             fprintf(stderr, "Failed to exec: %s\n", argv[0]);
             perror("execvp");
 
             fflush(stderr);
             fflush(stdout);
 
-            // Free argv before exit
-            for (char **p = argv; *p != NULL; ++p)
-                free(*p);
-            free(argv);
+            free_string_array(argv);
             _exit(errno);
         }
     }
@@ -743,7 +768,7 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     }
     free(segments.segments);
 
-    if (tokens[0] == NULL)
+    if (!tokens || tokens[0] == NULL)
         return;
 
     const char *infile;
@@ -762,9 +787,7 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     {
         perror("fork");
         // Free argv and its contents
-        for (char **p = argv; *p != NULL; ++p)
-            free(*p);
-        free(argv);
+        free_string_array(argv);
         return;
     }
 
@@ -784,13 +807,12 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
 
         execvp(argv[0], argv);
         perror("execvp");
+        fprintf(stderr, "Failed to exec: %s\n", argv[0]);
 
         fflush(stderr);
         fflush(stdout);
 
-        for (char **p = argv; *p != NULL; ++p)
-            free(*p);
-        free(argv);
+        free_string_array(argv);
         _exit(errno);
     }
 
@@ -800,7 +822,5 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
         wait_for_process_completion(argv[0], child_pid);
 
     // Free argv and its contents
-    for (char **p = argv; *p != NULL; ++p)
-        free(*p);
-    free(argv);
+    free_string_array(argv);
 }
