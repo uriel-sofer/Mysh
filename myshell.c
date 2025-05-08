@@ -177,7 +177,7 @@ static bool handle_mysh(char **tokens, bgjob *jobs, int *bgjobs_counter)
 
             if (inner_tokens[0] != NULL)
             {
-                const BuiltinResult result = handle_builtin(tokens, jobs, bgjobs_counter);
+                const BuiltinResult result = handle_builtin(inner_tokens, jobs, bgjobs_counter);
                 if (result == BUILTIN_EXIT)
                     break;
                 if (result == BUILTIN_NEEDS_PARENT || result == BUILTIN_HANDLED)
@@ -324,45 +324,43 @@ char **tokenizer(char *line, unsigned int *token_count)
     while (token != NULL)
     {
         const size_t len = strlen(token);
+        size_t start = 0;
 
-        // Use strstr to detect and split ">>" in the token
-        char *pos = strstr(token, ">>");
-        if (pos)
+        while (start < len)
         {
-            if (pos != token)
+            // Handle >>
+            if (token[start] == '>' && token[start + 1] == '>')
             {
-                *pos = '\0';
-                tokens[(*token_count)++] = token;
+                tokens[(*token_count)++] = ">>";
+                start += 2;
+                continue;
             }
 
-            tokens[(*token_count)++] = ">>";
+            // Handle a single special char
+            if (is_special_char(token[start]))
+            {
+                char *sym = malloc(2);
+                sym[0] = token[start];
+                sym[1] = '\0';
+                tokens[(*token_count)++] = sym;
+                start++;
+                continue;
+            }
 
-            char *after = pos + 2;
-            if (*after)
-                tokens[(*token_count)++] = after;
+            // Handle normal word until the next special char
+            const size_t word_start = start;
+            while (start < len && !is_special_char(token[start]))
+                start++;
 
-            token = strtok(NULL, " \t\n");
-            continue;
+            if (start > word_start)
+            {
+                const char backup = token[start];
+                token[start] = '\0';
+                tokens[(*token_count)++] = strdup(token + word_start);
+                token[start] = backup;
+            }
         }
 
-        // Handle token ending with &, <, >, or |
-        if (len > 1 && is_special_char(token[len - 1]))
-        {
-            const char last_char = token[len - 1];
-            token[len - 1] = '\0';
-            tokens[*token_count] = token;
-            (*token_count)++;
-            tokens[*token_count] =
-                (last_char == '&') ? "&" :
-                (last_char == '<') ? "<" :
-                (last_char == '>') ? ">" : "|";
-            (*token_count)++;
-        }
-        else
-        {
-            tokens[*token_count] = token;
-            (*token_count)++;
-        }
         token = strtok(NULL, " \t\n");
     }
 
@@ -481,6 +479,20 @@ void extract_input_output_redirection(char **tokens, const unsigned int token_co
 {
     *infile = NULL;
     *outfile = NULL;
+    for (unsigned int i = 0; i < token_count; i++)
+    {
+        if (tokens[i])
+        {
+            if ((strcmp(tokens[i], "<") == 0 || strcmp(tokens[i], ">") == 0 || strcmp(tokens[i], ">>") == 0))
+            {
+                if (i + 1 >= token_count || tokens[i + 1] == NULL)
+                {
+                    fprintf(stderr, "syntax error: missing filename for redirection '%s'\n", tokens[i]);
+                    return;
+                }
+            }
+        }
+    }
     for (unsigned int i = 0; i + 1 < token_count; i++)
     {
         if (tokens[i] && tokens[i + 1])
@@ -725,9 +737,11 @@ void execute_tokens(char **tokens, unsigned int token_count, bgjob *jobs, int *b
     const PipedSegments segments = pipes_segmentation(tokens, token_count, jobs, bgjobs_counter);
 
     if (segments.count > 1)
+    {
         execute_piped_commands(jobs, bgjobs_counter, segments);
-    else
-        free(segments.segments);
+        return;
+    }
+    free(segments.segments);
 
     if (tokens[0] == NULL)
         return;
